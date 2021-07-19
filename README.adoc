@@ -1,0 +1,240 @@
+= Consumer Driven Contracts like TDD to the API - script
+
+== Before the presentation
+
+```bash
+# Ensure that the PR branch is gone
+$ git branch -D pr
+# Revert all the changes to the beginning
+$ git push origin -f
+```
+
+== Consumer side:
+
+* Write a failing test on the consumer side (check the `cdc-like-tdd-to-the-api-consumer` project)
+* Clone this project
+* Create contracts
+** `contracts/beer/rest/shouldGrantABeerIfOldEnough.groovy`
+```groovy
+package contracts.beer.rest
+
+import org.springframework.cloud.contract.spec.Contract
+
+Contract.make {
+	request {
+		method POST()
+		url "/check"
+		body(age: 50)
+		headers {
+			contentType applicationJson()
+		}
+		bodyMatchers {
+			jsonPath '$.age', byRegex("[1-9][0-9]")
+		}
+	}
+	response {
+		status 200
+		body("""
+			{
+				"status": "OK"
+			}
+			""")
+		headers {
+			contentType applicationJson()
+		}
+	}
+}
+
+```
+** `contracts/beer/rest/shouldRejectABeerIfTooYoung.groovy`
+```groovy
+package contracts.beer.rest
+
+import org.springframework.cloud.contract.spec.Contract
+
+Contract.make {
+	request {
+		method POST()
+		url "/check"
+		body(age: 10)
+		headers {
+			contentType applicationJson()
+		}
+		bodyMatchers {
+			jsonPath '$.age', byRegex("[0-1][0-9]")
+		}
+	}
+	response {
+		status 200
+		body status: "NOT_OK"
+		headers {
+			contentType applicationJson()
+		}
+	}
+}
+```
+* Install the stubs via - `./mvnw clean install -DskipTests`. Show the JSON stubs.
+* Go back to the consumer code and add the `stubs` JAR to the classpath and add `@AutoConfigureStubRunner(ids="com.example:beer-api-producer")`
+* Modify the test to leverage the stub
+* File a PR to the producer code (create a branch)
+
+== Producer side
+
+* Take over the PR (check out the branch) `git checkout pr`
+* Run `./mvnw clean install` - the build will fail
+* Add an empty controller:
+
+.ProducerController.java - EMPTY
+```java
+package com.example;
+
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProducerController {
+
+	@RequestMapping(value = "/check",
+			method=RequestMethod.POST,
+			consumes="application/json",
+			produces="application/json")
+	public Response check(@RequestBody PersonToCheck personToCheck) {
+		return null;
+	}
+
+}
+
+class PersonToCheck {
+	public int age;
+
+	public PersonToCheck(int age) {
+		this.age = age;
+	}
+
+	public PersonToCheck() {
+	}
+}
+
+class Response {
+	public BeerCheckStatus status;
+
+	Response(BeerCheckStatus status) {
+		this.status = status;
+	}
+}
+
+enum BeerCheckStatus {
+	OK, NOT_OK
+}
+```
+
+* Run the build again `./mvnw clean install` - it will fail again in the same way
+* Setup the base class so that we're reaching the controller
+
+.BeerRestBase - EMPTY
+```java
+public abstract class BeerRestBase {
+
+	@BeforeEach
+	public void setup() {
+		RestAssuredMockMvc.standaloneSetup(new ProducerController());
+	}
+}
+```
+* Run the build again - `./mvnw clean install` - now it fails due to invalid payload and status
+* Add one response - the not ok one
+
+.ProducerController.java - NOT_OK
+```java
+@RestController
+public class ProducerController {
+
+	@RequestMapping(value = "/check",
+			method=RequestMethod.POST,
+			consumes="application/json",
+			produces="application/json")
+	public Response check(@RequestBody PersonToCheck personToCheck) {
+		return new Response(BeerCheckStatus.NOT_OK);
+	}
+
+}
+```
+
+* Add the second response - the OK one. Explain that we create a service that would go to the database to verify the age
+
+.ProducerController.java - DONE
+```java
+@RestController
+public class ProducerController {
+
+	private final PersonCheckingService personCheckingService;
+
+	public ProducerController(PersonCheckingService personCheckingService) {
+		this.personCheckingService = personCheckingService;
+	}
+
+	@RequestMapping(value = "/check",
+			method=RequestMethod.POST,
+			consumes="application/json",
+			produces="application/json")
+	public Response check(@RequestBody PersonToCheck personToCheck) {
+		if (this.personCheckingService.shouldGetBeer(personToCheck)) {
+			return new Response(BeerCheckStatus.OK);
+		}
+		return new Response(BeerCheckStatus.NOT_OK);
+
+	}
+
+interface PersonCheckingService {
+    Boolean shouldGetBeer(PersonToCheck personToCheck);
+}
+
+class PersonToCheck {
+    public int age;
+
+	public PersonToCheck(int age) {
+		this.age = age;
+	}
+
+	public PersonToCheck() {
+	}
+}
+
+class Response {
+    public BeerCheckStatus status;
+
+	Response(BeerCheckStatus status) {
+		this.status = status;
+	}
+}
+
+enum BeerCheckStatus {
+    OK, NOT_OK
+}
+```
+
+* What about the base class? We don't want to go to the database so we will inject a fake impl of the service.
+
+
+.BeerRestBase
+```java
+public abstract class BeerRestBase {
+	ProducerController producerController = new ProducerController(oldEnough());
+
+	@BeforeEach
+	public void setup() {
+		// https://github.com/spring-cloud/spring-cloud-contract/issues/1428
+		EncoderConfig encoderConfig = new EncoderConfig().appendDefaultContentCharsetToContentTypeIfUndefined(false);
+		RestAssuredMockMvc.config = new RestAssuredMockMvcConfig().encoderConfig(encoderConfig);
+		RestAssuredMockMvc.standaloneSetup(this.producerController);
+	}
+
+	private PersonCheckingService oldEnough() {
+		return argument -> argument.age >= 20;
+	}
+}
+```
+
+* Run the build again - `./mvnw clean install`
