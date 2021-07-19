@@ -6,6 +6,7 @@
 # Ensure that the PR branch is gone
 $ git branch -D pr
 # Revert all the changes to the beginning
+$ git reset --hard start
 $ git push origin -f
 ```
 
